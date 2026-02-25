@@ -5,7 +5,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 from scipy.stats import mannwhitneyu
 from statsmodels.stats.multitest import multipletests
-
+from scipy.stats import pearsonr
 
 def violin_two_groups_by_bool_mean_matplotlib(
     df,
@@ -272,3 +272,115 @@ def violin_two_groups_by_bool_mean_matplotlib(
 
     stats = {"U": U, "p": pval, "q": qval}
     return fig, ax, d, stats
+
+
+
+
+def scatter_matrix_entries(
+    M1,
+    M2,
+    *,
+    xlabel="Matrix 1",
+    ylabel="Matrix 2",
+    title=None,
+    s=8,
+    alpha=0.4,
+    color="#1f77b4",
+    fit_line=True,
+    rasterize_points=True,
+    save_svg=None,          # NEW: path to save SVG
+    dpi=1200,
+):
+    """
+    Scatter plot of corresponding entries in two same-shaped matrices
+    and compute Pearson correlation.
+
+    Parameters
+    ----------
+    M1, M2 : array-like
+        Matrices of identical shape.
+    rasterize_points : bool
+        Rasterize scatter points (recommended for large matrices).
+    save_svg : str or None
+        If provided, save figure as SVG with rasterized points.
+    dpi : int
+        DPI used for rasterized elements in SVG.
+
+    Returns
+    -------
+    r, p : float
+        Pearson correlation coefficient and p-value.
+    """
+
+    # --- SVG-friendly text ---
+    prev_svg = mpl.rcParams.get("svg.fonttype", None)
+    mpl.rcParams["svg.fonttype"] = "none"
+
+    M1 = np.asarray(M1)
+    M2 = np.asarray(M2)
+
+    if M1.shape != M2.shape:
+        raise ValueError("M1 and M2 must have the same shape")
+
+    # flatten + drop NaNs / infs
+    x = M1.ravel()
+    y = M2.ravel()
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+
+    if len(x) < 2:
+        raise ValueError("Not enough valid entries to compute correlation")
+
+    # Pearson correlation
+    r, p = pearsonr(x, y)
+
+    # --- plot ---
+    fig, ax = plt.subplots(figsize=(5, 5))
+
+    sc = ax.scatter(x, y, s=s, alpha=alpha, color=color)
+    if rasterize_points:
+        sc.set_rasterized(True)
+
+    if fit_line:
+        m, b = np.polyfit(x, y, 1)
+        xx = np.linspace(x.min(), x.max(), 200)
+        ax.plot(xx, m * xx + b, color="black", lw=2)
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title)
+
+    ax.text(
+        0.02, 0.98,
+        f"Pearson r = {r:.3f}\n"
+        f"p = {p:.2e}\n"
+        f"N = {len(x)}",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+    )
+
+    ax.grid(False)
+    plt.tight_layout()
+
+    # --- save SVG ---
+    if save_svg:
+        fig.savefig(
+            save_svg,
+            format="svg",
+            dpi=dpi,
+            bbox_inches="tight",
+            transparent=True,
+        )
+
+    plt.show()
+
+    # restore rcParams
+    if prev_svg is not None:
+        mpl.rcParams["svg.fonttype"] = prev_svg
+
+    return r, p
+
