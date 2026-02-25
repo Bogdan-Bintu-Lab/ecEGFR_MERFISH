@@ -384,3 +384,293 @@ def scatter_matrix_entries(
 
     return r, p
 
+from matplotlib.ticker import PercentFormatter
+import pandas as pd
+def plot_bars_with_fisher_annotations(
+    df_props,                 # must contain ['gene','p_chr7','p_ecDNA','pval'] ; 'delta' optional
+    df_pb=None,               # needed only when plot_exon=True; columns ['gene','exon_expr'] (CPM)
+    sort_by="p_ecDNA",
+    figsize=(14, 6),
+    rotate_xticks=45,
+    plot_exon=True,
+    title=None,
+    save_svg_path=None,       # <-- NEW: if given, saves SVG there
+    dpi=200,                   # irrelevant for pure SVG vectors, but kept for consistency,
+    color_ec = 'C0',
+    color_chr7 = 'C1'
+):
+    # --- set Arial font locally, restore after ---
+    old_rc = plt.rcParams.copy()
+    plt.rcParams["font.family"] = "Arial"
+    plt.rcParams["svg.fonttype"] = "none"  # keep text as text in SVG (not paths)
+
+    try:
+        def _p_to_stars(p):
+            if not np.isfinite(p): return "n.s."
+            if p < 1e-4: return "***"
+            if p < 1e-3: return "**"
+            if p < 1e-2: return "*"
+            return "n.s."
+
+        # ensure delta exists
+        if "delta" not in df_props.columns:
+            df_props = df_props.assign(delta=df_props["p_ecDNA"] - df_props["p_chr7"])
+
+        # merge pseudobulk (only if plotting it)
+        if plot_exon:
+            if df_pb is None:
+                raise ValueError("df_pb is required when plot_exon=True")
+            df_pb2 = df_pb.copy()
+            df_pb2["logCPM"] = np.log10(np.clip(df_pb2["exon_expr"].astype(float), 1e-6, None))
+            dfm = (df_props.merge(df_pb2[["gene","logCPM"]], on="gene", how="left")
+                          .dropna(subset=["p_chr7","p_ecDNA","logCPM"]))
+        else:
+            dfm = df_props.dropna(subset=["p_chr7","p_ecDNA"]).copy()
+
+        # sort
+        dfm = dfm.sort_values(sort_by, ascending=False, ignore_index=True)
+
+        genes = dfm["gene"].tolist()
+        x = np.arange(len(genes))
+        width = 0.38
+
+        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+
+        # ecDNA (left), chr7 (right)
+        bars_ec   = ax.bar(x - width/2, dfm["p_ecDNA"].to_numpy(float), width, color=color_ec, label="ecDNA")
+        bars_chr7 = ax.bar(x + width/2, dfm["p_chr7"].to_numpy(float),  width, color=color_chr7, label="chr7")
+
+        # optionally add pseudobulk logCPM as negative green bars with right axis
+        if plot_exon:
+            log_min = float(dfm["logCPM"].min()); log_max = float(dfm["logCPM"].max())
+            pad = 0.05 * max(log_max - log_min, 1e-9)
+            lo, hi = log_min - pad, log_max + pad
+            rng = hi - lo
+            t = np.clip((dfm["logCPM"] - lo) / rng, 0, 1)   # 0..1 after padding
+            neg_heights = -t.values
+            ax.bar(x, neg_heights, width=width*0.9, color="green", alpha=0.65, label="Exon expr (logCPM)")
+
+        # x labels
+        ax.set_xticks(x)
+        ax.set_xticklabels(genes, rotation=rotate_xticks, ha="right")
+
+        # y-limits and left axis ticks (positive only)
+        line_pad    = 0.04
+        sig_gap     = 0.015
+        delta_gap   = 0.065
+
+        needed_tops = [max(float(r["p_ecDNA"]), float(r["p_chr7"])) + line_pad + sig_gap + delta_gap
+                       for _, r in dfm.iterrows()]
+        upper = max(1.05, max(needed_tops, default=1.05) + 0.02)
+        lower = -1.05 if plot_exon else 0.0
+        ax.set_ylim(lower, upper)
+
+        pos_ticks = np.linspace(0, 1, 6)
+        ax.set_yticks(pos_ticks)
+        ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+        ax.set_ylabel("Bursting (%)")
+
+        # right axis only when plotting exon bars
+        if plot_exon:
+            ax2 = ax.twinx()
+            ax2.set_ylim(ax.get_ylim())
+            tick_vals = np.linspace(lo, hi, 5)
+            tick_pos  = -((tick_vals - lo) / rng)
+            ax2.set_yticks(tick_pos)
+            ax2.set_yticklabels([f"{v:.2f}" for v in tick_vals])
+            ax2.set_ylabel("Pseudobulk exon expression (log10 CPM)")
+
+        # annotate % inside bars
+        def _annotate_inside(bars, vals):
+            for b, v in zip(bars, vals):
+                if np.isfinite(v):
+                    y = max(v - 0.02, 0.02)
+                    ax.text(b.get_x() + b.get_width()/2, y, f"{v:.0%}",
+                            ha="center", va="top", fontsize=8)
+        _annotate_inside(bars_ec,   dfm["p_ecDNA"].to_numpy(float))
+        _annotate_inside(bars_chr7, dfm["p_chr7"].to_numpy(float))
+
+        # significance + delta annotations between bars
+        for i, r in dfm.iterrows():
+            h_left  = float(r["p_ecDNA"])
+            h_right = float(r["p_chr7"])
+            y_line  = max(h_left, h_right) + line_pad
+
+            ax.plot([x[i] - width/2, x[i] + width/2], [y_line, y_line], color="k", lw=0.8)
+            sig = _p_to_stars(r["pval"])
+            ax.text(x[i], y_line + sig_gap, sig, ha="center", va="bottom", fontsize=10)
+
+            d = float(r["p_ecDNA"] - r["p_chr7"])
+            ax.text(x[i], y_line + sig_gap + delta_gap, f"Δ={d:+.0%}",
+                    ha="center", va="bottom", fontsize=9, color="black")
+
+        ax.legend(loc="upper right", frameon=False)
+
+        if title is None:
+            title = ("Bursting percentage (top) with per-gene Fisher significance and Δ(ecDNA−chr7)"
+                     + ("" if not plot_exon else "\nand pseudobulk exon expression (bottom)"))
+        ax.set_title(title)
+
+        plt.tight_layout()
+
+        # --- save as SVG if requested ---
+        if save_svg_path is not None:
+            fig.savefig(save_svg_path, format="svg", bbox_inches="tight")
+            print(f"Saved SVG to: {save_svg_path}")
+
+        return fig, ax
+
+    finally:
+        # restore rcParams so we don't globally change your session
+        plt.rcParams.update(old_rc)
+
+import statsmodels.api as sm
+
+def plot_genes_vs_rgs_percent_bins_binnedR2(
+    df_circular,
+    x_col='total_genes_transcribed',
+    y_col='rgs',
+    n_groups=20,
+    tick_positions=[25, 50, 75, 100],
+    line_color='#4169E1',     # hex color for fitted line
+    save_svg=False,
+    svg_path=None,
+    title=None,               # optional title
+    ylim=None,                # option to set y limits
+    figsize=(4, 3),
+    dpi=150,
+    n_boot=2000,              # bootstrap samples for CI of median
+    ci=95,                    # CI level for median
+    seed=None,                # optional random seed
+):
+    # --- preserve and set rcParams (Arial + text in SVG) ---
+    old_rc = plt.rcParams.copy()
+    plt.rcParams['font.family'] = 'Arial'
+    plt.rcParams['pdf.fonttype'] = 42
+    plt.rcParams['ps.fonttype'] = 42
+    plt.rcParams['svg.fonttype'] = 'none'   # keep text as <text> in SVG
+
+    rng = np.random.default_rng(seed)
+
+    df = df_circular[[x_col, y_col]].dropna().copy()
+
+    # Normalize to %
+    xmax = df[x_col].max()
+    df['pct'] = df[x_col] / xmax * 100.0
+
+    # Make equal-width bins (0–100)
+    edges = np.linspace(0, 100, n_groups + 1)
+    df['bin'] = pd.cut(df['pct'], bins=edges, include_lowest=True, labels=False)
+
+    # --- compute median + 95% CI of median per bin (bootstrap) ---
+    grouped = df.groupby('bin')[y_col]
+
+    rows = []
+    alpha = 100 - ci
+    for b, vals in grouped:
+        arr = vals.to_numpy()
+        n = len(arr)
+        if n == 0:
+            continue
+        med = np.median(arr)
+
+        if n > 1:
+            boot = rng.choice(arr, size=(n_boot, n), replace=True)
+            boot_meds = np.median(boot, axis=1)
+            lo, hi = np.percentile(boot_meds, [alpha/2, 100 - alpha/2])
+        else:
+            lo = hi = med
+
+        rows.append({
+            'bin': b,
+            'median': med,
+            'ci_lo': lo,
+            'ci_hi': hi,
+            'count': n,
+        })
+
+    summary = pd.DataFrame(rows).set_index('bin').sort_index()
+
+    bins = summary.index.values.astype(int)
+    x_centers = (edges[:-1] + edges[1:]) / 2
+    x_centers = x_centers[bins]
+
+    y_med   = summary['median'].values
+    yerr_lo = y_med - summary['ci_lo'].values
+    yerr_hi = summary['ci_hi'].values - y_med
+
+    # --- regression on binned medians ---
+    X_bin = x_centers
+    Y_bin = y_med
+    Xmat  = sm.add_constant(X_bin)
+    model = sm.OLS(Y_bin, Xmat).fit()
+
+    slope, intercept = model.params[1], model.params[0]
+    r2, pval_reg = model.rsquared, model.pvalues[1]
+
+    # --- Pearson correlation on binned medians ---
+    if len(X_bin) > 1:
+        r_pearson, p_pearson = pearsonr(X_bin, Y_bin)
+    else:
+        r_pearson, p_pearson = np.nan, np.nan
+
+    # --- plot ---
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+
+    # dots + 95% CI whiskers (median at center)
+    ax.errorbar(
+        X_bin, Y_bin,
+        yerr=[yerr_lo, yerr_hi],
+        fmt='o', color='black',
+        ecolor='gray',
+        elinewidth=1.4,
+        capsize=3
+    )
+
+    # fitted line
+    xx = np.linspace(0, 100, 300)
+    yy = intercept + slope * xx
+    ax.plot(xx, yy, color=line_color, lw=2)
+
+    # stats text (show both R² and Pearson)
+    ax.text(
+        0.05, 0.95,
+        f"y = {slope:.3f}x + {intercept:.2f}\n"
+        f"$R^2$ = {r2:.3f}\n"
+        f"Pearson r = {r_pearson:.3f}\n"
+        f"p (Pearson) = {p_pearson:.2e}",
+        transform=ax.transAxes, va='top', fontsize=9
+    )
+
+    # axis formatting
+    ax.set_xlim(0, 100)
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels([str(t) for t in tick_positions])
+    ax.set_xlabel("Genes transcribed (%)")
+    ax.set_ylabel("Rg (µm)")
+
+    # apply y-limits if provided
+    if ylim is not None:
+        ax.set_ylim(ylim)
+
+    # optional title
+    if title is not None:
+        ax.set_title(title)
+
+    # clean spines
+    for side in ['top', 'right']:
+        ax.spines[side].set_visible(False)
+
+    plt.tight_layout()
+
+    # optional SVG saving
+    if save_svg:
+        if svg_path is None:
+            raise ValueError("svg_path must be provided when save_svg=True")
+        fig.savefig(svg_path, format='svg', bbox_inches='tight')
+
+    # restore rcParams
+    plt.rcParams.update(old_rc)
+
+    return fig, ax, summary, model, r_pearson, p_pearson
+
