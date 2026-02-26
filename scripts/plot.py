@@ -674,3 +674,215 @@ def plot_genes_vs_rgs_percent_bins_binnedR2(
 
     return fig, ax, summary, model, r_pearson, p_pearson
 
+from matplotlib.colors import Normalize
+from scipy.stats import pearsonr
+def _bootstrap_ci_median(x, n_boot=2000, ci=95, seed=None):
+    """
+    Bootstrap CI for the median.
+    Returns (median, low_CI, high_CI)
+    """
+    x = np.asarray(x)
+    x = x[np.isfinite(x)]
+    if len(x) == 0:
+        return np.nan, np.nan, np.nan
+    if len(x) == 1:
+        return x[0], x[0], x[0]
+
+    if seed is not None:
+        rng = np.random.default_rng(seed)
+        idx = rng.integers(0, len(x), size=(n_boot, len(x)))
+    else:
+        idx = np.random.randint(0, len(x), size=(n_boot, len(x)))
+
+    samples = x[idx]
+    med_boot = np.median(samples, axis=1)
+
+    median_val = np.median(x)
+    alpha = (100 - ci) / 2
+    low = np.percentile(med_boot, alpha)
+    high = np.percentile(med_boot, 100 - alpha)
+
+    return median_val, low, high
+def dotplot_bootstrap_median_with_pearson(
+    df_plot,
+    *,
+    x_col,
+    y_col,
+    z_col,
+    group_col,
+    n_groups=None,
+    y_norm=None,
+    z_norm=None,              # NEW: divide z by this
+    z_to_percent=False,        # NEW: if True, z becomes 0-100 scale
+    n_boot=2000,
+    ci=95,
+    cmap="rainbow",
+    figsize=(5, 4),
+    s=90,
+    alpha=0.9,
+    edgecolor="black",
+    linewidth=0.8,
+    title=None,
+    x_label=None,
+    y_label=None,
+    z_label=None,
+    font_family="Arial",
+    save_svg=None,
+    dpi=800,
+    seed=None,
+    ax=None
+):
+    import numpy as np
+    import pandas as pd
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+    from scipy.stats import pearsonr
+
+    # ---------- SVG-friendly font ----------
+    prev_font = mpl.rcParams.get("font.family", None)
+    prev_svg  = mpl.rcParams.get("svg.fonttype", None)
+    mpl.rcParams["font.family"] = font_family
+    mpl.rcParams["svg.fonttype"] = "none"
+
+    # ---------- select + deduplicate columns ----------
+    needed = list(set([x_col, y_col, z_col, group_col]))
+    df = df_plot[needed].dropna()
+
+    # ---------- decide z normalization ----------
+    # (compute default z_norm from data if requested)
+    z_scale = 1.0
+    if z_to_percent:
+        if z_norm is None:
+            z_norm = float(pd.to_numeric(df[z_col], errors="coerce").max())
+        z_scale = 100.0
+
+    if z_norm is not None:
+        z_norm = float(z_norm) if z_norm not in [0, None, np.nan] else 1.0
+
+    # ---------- grouping ----------
+    if n_groups is None:
+        df["_group"] = df[group_col]
+        groups = sorted(df["_group"].unique())
+        group_ranks = {g: i for i, g in enumerate(groups)}
+    else:
+        q = pd.to_numeric(df[group_col], errors="coerce")
+        mask = q.notna()
+        df = df.loc[mask].copy()
+        q = q.loc[mask]
+
+        ranks = q.rank(method="first")  # 1..N unique ranks
+        bins = pd.qcut(ranks, q=n_groups, duplicates="raise")
+        df["_group"] = bins
+
+        groups = list(df["_group"].cat.categories)
+        group_ranks = {g: i for i, g in enumerate(groups)}
+
+    # ---------- per-group stats ----------
+    rows = []
+    for g in groups:
+        sub = df[df["_group"] == g]
+        if len(sub) == 0:
+            continue
+
+        x_med, x_lo, x_hi = _bootstrap_ci_median(sub[x_col], n_boot=n_boot, ci=ci, seed=seed)
+        y_med, y_lo, y_hi = _bootstrap_ci_median(sub[y_col], n_boot=n_boot, ci=ci, seed=seed)
+
+        if y_norm is not None:
+            y_med /= y_norm
+            y_lo  /= y_norm
+            y_hi  /= y_norm
+
+        z_med, z_lo, z_hi = _bootstrap_ci_median(sub[z_col], n_boot=n_boot, ci=ci, seed=seed)
+
+        # ---- NEW: normalize z (and optionally convert to %) ----
+        if z_norm is not None:
+            z_med = (z_med / z_norm) * z_scale
+            z_lo  = (z_lo  / z_norm) * z_scale
+            z_hi  = (z_hi  / z_norm) * z_scale
+        elif z_to_percent:
+            # z_to_percent=True always implies a norm; this is a safety fallback
+            z_med *= z_scale
+            z_lo  *= z_scale
+            z_hi  *= z_scale
+
+        rows.append(dict(
+            group=g,
+            group_rank=group_ranks[g],
+            N=len(sub),
+            x_med=x_med, x_lo=x_lo, x_hi=x_hi,
+            y_med=y_med, y_lo=y_lo, y_hi=y_hi,
+            z_med=z_med, z_lo=z_lo, z_hi=z_hi,
+        ))
+
+    stats = pd.DataFrame(rows).sort_values("group_rank").reset_index(drop=True)
+
+    # ---------- Pearson on binned medians ----------
+    if len(stats) > 1:
+        pearson_r, pearson_p = pearsonr(stats["x_med"], stats["y_med"])
+    else:
+        pearson_r, pearson_p = np.nan, np.nan
+    stats["pearson_r"] = pearson_r
+    stats["pearson_p"] = pearson_p
+
+    # ---------- plotting ----------
+    vmin, vmax = stats["z_med"].min(), stats["z_med"].max()
+    if np.isclose(vmin, vmax):
+        vmax = vmin + 1e-6
+    norm = Normalize(vmin=vmin, vmax=vmax)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize, dpi=150)
+    else:
+        fig = ax.figure
+
+    ax.errorbar(
+        stats["x_med"], stats["y_med"],
+        xerr=[stats["x_med"] - stats["x_lo"], stats["x_hi"] - stats["x_med"]],
+        yerr=[stats["y_med"] - stats["y_lo"], stats["y_hi"] - stats["y_med"]],
+        fmt="none", ecolor="black", elinewidth=1.1, zorder=2,
+    )
+
+    sc = ax.scatter(
+        stats["x_med"], stats["y_med"],
+        c=stats["z_med"], cmap=cmap, norm=norm,
+        s=s, alpha=alpha, edgecolors=edgecolor, linewidth=linewidth, zorder=3,
+    )
+
+    ax.set_xlabel(x_label or x_col)
+    ax.set_ylabel(y_label or y_col)
+
+    if title is not None:
+        ax.set_title(title)
+
+    if np.isfinite(pearson_r):
+        ax.text(
+            0.02, 0.98,
+            f"Pearson r = {pearson_r:.3f}\np = {pearson_p:.2e}",
+            transform=ax.transAxes,
+            ha="left", va="top", fontsize=18,
+        )
+
+    cb = plt.colorbar(sc, ax=ax)
+
+    if z_label is None:
+        if z_to_percent or (z_norm is not None and np.isclose(z_scale, 100.0)):
+            z_label = f"{z_col} (%)"
+        else:
+            z_label = z_col
+    cb.set_label(z_label)
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    if save_svg:
+        fig.savefig(save_svg, format="svg", dpi=dpi, bbox_inches="tight")
+
+    # ---------- restore rcParams ----------
+    if prev_font is not None:
+        mpl.rcParams["font.family"] = prev_font
+    if prev_svg is not None:
+        mpl.rcParams["svg.fonttype"] = prev_svg
+
+    return fig, ax, stats
+
