@@ -2508,3 +2508,131 @@ def get_medianH_for_XF(
 
     medianH = np.asarray(medianH_list, dtype=float)
     return medianH, ugroups
+
+
+# --- helper: adapt to your filename pattern ---
+def get_gene_name(filename):
+    return os.path.basename(filename).split('__')[1].split('_introns')[0]
+
+import numpy as np
+import pandas as pd
+
+def build_bursting_binary_matrix_merge_on_global_row_pool(
+    save_iQ_tbl_list,
+    uCols,
+    medianH_C,
+    dic_hyb_color,
+    th_zscore_dict,
+    brightness_col="anchor_brightness",
+    pool_col="pool",
+    meta_cols=("cell_id", "pool", "trace_id", "avg_NN_dist",
+               "global_row", "matrix_name"),
+    eps=1e-12,
+    drop_other_pools=True,
+):
+    """
+    Output:
+      - 6 meta columns
+      - + one binary column per gene
+      - + total_genes_transcribed
+
+    Rows are the INTERSECTION across all genes, merged on (global_row, pool).
+    Assumes (global_row, pool) is the unique ID.
+    """
+
+    merge_keys = ["global_row", pool_col]
+
+    # per-color stats lookup
+    stats_col_df = pd.DataFrame(
+        medianH_C,
+        index=pd.Index(uCols, name="col"),
+        columns=["median", "std"]
+    ).astype(float)
+
+    def _safe_gene(path: str) -> str:
+        try:
+            return get_gene_name(path)
+        except Exception:
+            base = str(path).split("/")[-1].split("\\")[-1]
+            base = base.split("__")[0].split(".")[0]
+            return base.split("_exons")[0]
+
+    out = None
+    gene_cols = []
+
+    for file in save_iQ_tbl_list:
+        gene = _safe_gene(file)
+        if gene in gene_cols:
+            raise ValueError(f"Duplicate gene name detected: {gene}")
+        gene_cols.append(gene)
+
+        tbl = pd.read_csv(file, index_col=0)
+
+        # --- column checks ---
+        missing = [c for c in meta_cols if c not in tbl.columns]
+        if missing:
+            raise KeyError(f"{file} missing meta columns: {missing}")
+        if brightness_col not in tbl.columns:
+            raise KeyError(f"{file} missing {brightness_col}")
+        if pool_col not in tbl.columns:
+            raise KeyError(f"{file} missing {pool_col}")
+        if "global_row" not in tbl.columns:
+            raise KeyError(f"{file} missing global_row")
+
+        # --- subset & optional pool filtering ---
+        d = tbl.loc[:, list(meta_cols) + [brightness_col]].copy()
+        if drop_other_pools:
+            d = d[d[pool_col].isin(["linear", "circular"])].copy()
+
+        # --- sanity: composite key should be unique within each file ---
+        if d.duplicated(subset=merge_keys).any():
+            ndup = d.loc[d.duplicated(subset=merge_keys, keep=False), merge_keys].drop_duplicates().shape[0]
+            raise ValueError(
+                f"{file}: found {ndup} duplicated (global_row, pool) keys. "
+                f"Expected uniqueness on {merge_keys}."
+            )
+
+        # --- iQ → color ---
+        iq = _parse_iq_from_filename(file)
+        if iq not in dic_hyb_color:
+            raise ValueError(f"iQ {iq} not in dic_hyb_color for file={file}")
+
+        col = int(dic_hyb_color[iq])
+        if col not in stats_col_df.index:
+            raise ValueError(f"Color {col} not in stats_col_df for file={file}")
+
+        med = float(stats_col_df.loc[col, "median"])
+        std = float(stats_col_df.loc[col, "std"])
+        std = std if np.isfinite(std) and std > 0 else eps
+        th = float(th_zscore_dict.get(col, 0.0))
+
+        # --- z-score → binary ---
+        h = d[brightness_col].to_numpy(float)
+        z = (h - med) / std
+        d[gene] = np.where(np.isfinite(z), (z >= th).astype(np.int8), 0)
+
+        # --- keep only what we need for merging ---
+        if out is None:
+            out = d.loc[:, list(meta_cols) + [gene]].copy()
+        else:
+            out = out.merge(
+                d.loc[:, merge_keys + [gene]],
+                on=merge_keys,
+                how="inner"   # intersection across genes
+            )
+
+    # --- total genes transcribed ---
+    out["total_genes_transcribed"] = out[gene_cols].fillna(0).astype(int).sum(axis=1)
+
+    # --- final column order ---
+    out = out.loc[:, list(meta_cols) + gene_cols + ["total_genes_transcribed"]]
+
+    # --- sanity checks ---
+    if out.duplicated(subset=merge_keys).any():
+        raise AssertionError("Final output has duplicated (global_row, pool) keys (unexpected).")
+
+    max_allowed = len(save_iQ_tbl_list)
+    if out["total_genes_transcribed"].max() > max_allowed:
+        raise AssertionError("total_genes_transcribed exceeds expected maximum")
+
+    return out
