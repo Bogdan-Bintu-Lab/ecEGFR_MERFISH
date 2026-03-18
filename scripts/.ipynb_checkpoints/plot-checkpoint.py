@@ -384,6 +384,407 @@ def scatter_matrix_entries(
 
     return r, p
 
+
+import os
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from scipy.stats import mannwhitneyu
+from statsmodels.stats.multitest import multipletests
+def violin_two_groups_by_bool_median_matplotlib(
+    df,
+    val_col,
+    bool_col,
+    ax=None,
+    order=(False, True),
+    group_labels=None,
+
+    # layout
+    x_gap=0.55,
+    width=0.35,
+    fig_size=(4.6, 4.4),
+
+    # style
+    colors=("#3a923a", "#8e6bbf"),
+    grid_color="0.9",
+    linewidth=1.1,
+    alpha=1.0,
+    font_family="Arial",
+    ylim=None,
+
+    # labels
+    x_label="",
+    y_label=None,
+    title=None,
+
+    # counts
+    show_n=True,
+    n_fmt="n={:,}",
+
+    # ---- classic inner box style ----
+    show_box=True,
+    box_width_frac=0.25,
+    box_facecolor="black",
+    box_alpha=1.0,
+    box_edgecolor="black",
+    box_lw=1.2,
+    whisker_lw=1.2,
+    cap_lw=1.2,
+    median_lw=2.8,
+
+    # ---- mean dot optional ----
+    show_mean=False,
+    mean_dot_size=120,
+    mean_dot_face="white",
+    mean_dot_edge="black",
+    mean_dot_lw=1.2,
+
+    # ---- value transforms ----
+    transform="none",           # "none" | "log2" | "log2p1" | "log2_signed" | "zscore" | "robust_zscore"
+    log_eps=1e-9,               # used for log transforms
+    zscore_scope="pooled",      # "pooled" | "within_group"
+
+    # ---- NEW: annotate median text above each violin ----
+    annotate_median=True,
+    median_fmt="med={:.2f}",
+    median_text_color="black",
+    median_text_size=10,
+    median_text_weight="bold",
+    median_text_yfrac=0.965,    # relative (0..1) within axis y-lims
+    median_text_box=True,
+    median_text_box_fc="white",
+    median_text_box_ec="none",
+    median_text_box_alpha=0.75,
+
+    # stats
+    do_mannwhitney=True,
+    mannwhitney_alternative="two-sided",
+    other_pvals=None,
+    stats_fontsize=11,
+
+    # SVG
+    rasterize_violins=False,
+    save_svg=None,
+    dpi=800,
+):
+    """
+    Two-group violin plot split by boolean column.
+
+    Transforms:
+      - "log2": allows negatives by shifting all values by (-min + eps) if needed, then log2(x + shift)
+      - "log2_signed": sign(x) * log2(1 + |x|)
+      - "log2p1": log2(1 + x), requires x>=0
+      - "zscore"/"robust_zscore": pooled vs within-group scaling
+
+    Median text annotation (annotate_median=True):
+      Writes median above each violin using final axis limits (works with custom ylim).
+    """
+
+    # ---- rc for SVG + font ----
+    prev_font = mpl.rcParams.get("font.family", None)
+    prev_svg = mpl.rcParams.get("svg.fonttype", None)
+    mpl.rcParams["font.family"] = font_family
+    mpl.rcParams["svg.fonttype"] = "none"
+
+    # ---- clean data ----
+    d = df[[val_col, bool_col]].dropna().copy()
+    d[bool_col] = d[bool_col].astype(bool)
+
+    a_bool, b_bool = bool(order[0]), bool(order[1])
+
+    if group_labels is None:
+        lab_a, lab_b = str(a_bool), str(b_bool)
+    elif isinstance(group_labels, dict):
+        lab_a = group_labels.get(a_bool, str(a_bool))
+        lab_b = group_labels.get(b_bool, str(b_bool))
+    else:
+        lab_a, lab_b = group_labels
+
+    vals_a = d.loc[d[bool_col] == a_bool, val_col].to_numpy(float)
+    vals_b = d.loc[d[bool_col] == b_bool, val_col].to_numpy(float)
+    vals_a = vals_a[np.isfinite(vals_a)]
+    vals_b = vals_b[np.isfinite(vals_b)]
+
+    if vals_a.size == 0 or vals_b.size == 0:
+        raise ValueError("One group empty after filtering.")
+
+    # ----------------------------
+    # transform values
+    # ----------------------------
+    transform = (transform or "none").lower()
+    zscore_scope = (zscore_scope or "pooled").lower()
+
+    def _zscore(x: np.ndarray, mu: float, sd: float) -> np.ndarray:
+        sd = float(sd)
+        if not np.isfinite(sd) or sd <= 0:
+            return np.zeros_like(x, dtype=float)
+        return (x - float(mu)) / sd
+
+    def _robust_zscore(x: np.ndarray, med: float, mad: float) -> np.ndarray:
+        denom = 1.4826 * float(mad)
+        if not np.isfinite(denom) or denom <= 0:
+            return np.zeros_like(x, dtype=float)
+        return (x - float(med)) / denom
+
+    if transform == "none":
+        pass
+
+    elif transform in ("log2", "log"):
+        pooled = np.concatenate([vals_a, vals_b])
+        min_val = float(np.min(pooled))
+        # shift so argument is >0
+        shift = (-min_val + float(log_eps)) if min_val <= 0 else float(log_eps)
+        vals_a = np.log2(vals_a + shift)
+        vals_b = np.log2(vals_b + shift)
+
+    elif transform in ("log2_signed", "signed_log2"):
+        vals_a = np.sign(vals_a) * np.log2(1.0 + np.abs(vals_a))
+        vals_b = np.sign(vals_b) * np.log2(1.0 + np.abs(vals_b))
+
+    elif transform == "log2p1":
+        pooled = np.concatenate([vals_a, vals_b])
+        if np.any(pooled < 0):
+            raise ValueError("transform='log2p1' requires non-negative values.")
+        vals_a = np.log2(1.0 + vals_a)
+        vals_b = np.log2(1.0 + vals_b)
+
+    elif transform in ("zscore", "z-score", "zs"):
+        if zscore_scope == "pooled":
+            pooled = np.concatenate([vals_a, vals_b])
+            mu = np.mean(pooled)
+            sd = np.std(pooled, ddof=0)
+            vals_a = _zscore(vals_a, mu, sd)
+            vals_b = _zscore(vals_b, mu, sd)
+        elif zscore_scope == "within_group":
+            vals_a = _zscore(vals_a, np.mean(vals_a), np.std(vals_a, ddof=0))
+            vals_b = _zscore(vals_b, np.mean(vals_b), np.std(vals_b, ddof=0))
+        else:
+            raise ValueError("zscore_scope must be 'pooled' or 'within_group'.")
+
+    elif transform in ("robust_zscore", "robust", "mad"):
+        def mad1(x):
+            med = np.median(x)
+            return med, np.median(np.abs(x - med))
+
+        if zscore_scope == "pooled":
+            pooled = np.concatenate([vals_a, vals_b])
+            med, madv = mad1(pooled)
+            vals_a = _robust_zscore(vals_a, med, madv)
+            vals_b = _robust_zscore(vals_b, med, madv)
+        elif zscore_scope == "within_group":
+            med_a, mad_a = mad1(vals_a)
+            med_b, mad_b = mad1(vals_b)
+            vals_a = _robust_zscore(vals_a, med_a, mad_a)
+            vals_b = _robust_zscore(vals_b, med_b, mad_b)
+        else:
+            raise ValueError("zscore_scope must be 'pooled' or 'within_group'.")
+    else:
+        raise ValueError(
+            "transform must be one of: 'none', 'log2', 'log2p1', 'log2_signed', 'zscore', 'robust_zscore'."
+        )
+
+    # ---- stats (computed on transformed values) ----
+    U = pval = np.nan
+    if do_mannwhitney:
+        res = mannwhitneyu(vals_a, vals_b, alternative=mannwhitney_alternative)
+        U = float(res.statistic)
+        pval = float(res.pvalue)
+
+    qval = None
+    if other_pvals is not None and np.isfinite(pval):
+        _, qvec, _, _ = multipletests([pval] + list(other_pvals), method="fdr_bh")
+        qval = float(qvec[0])
+
+    # ---- fig/ax ----
+    if ax is None:
+        fig, ax = plt.subplots(figsize=fig_size, dpi=300)
+    else:
+        fig = ax.figure
+
+    ax.set_axisbelow(True)
+    ax.grid(axis="y", color=grid_color, lw=1)
+
+    # ---- violins ----
+    positions = [0.0, x_gap]
+    parts = ax.violinplot(
+        [vals_a, vals_b],
+        positions=positions,
+        widths=width,
+        showmeans=False,
+        showmedians=False,
+        showextrema=False,
+    )
+
+    for body, col in zip(parts["bodies"], colors):
+        body.set_facecolor(col)
+        body.set_edgecolor("black")
+        body.set_linewidth(linewidth)
+        body.set_alpha(alpha)
+        if rasterize_violins:
+            body.set_rasterized(True)
+
+    # ---- inner classic box (IQR + median + whiskers) ----
+    if show_box:
+        box_width = width * box_width_frac
+        bp = ax.boxplot(
+            [vals_a, vals_b],
+            positions=positions,
+            widths=box_width,
+            patch_artist=True,
+            showfliers=False,
+            whis=1.5,
+            zorder=4,
+        )
+        for patch in bp["boxes"]:
+            patch.set_facecolor(box_facecolor)
+            patch.set_alpha(box_alpha)
+            patch.set_edgecolor(box_edgecolor)
+            patch.set_linewidth(box_lw)
+        for w in bp["whiskers"]:
+            w.set_color("black")
+            w.set_linewidth(whisker_lw)
+        for c in bp["caps"]:
+            c.set_color("black")
+            c.set_linewidth(cap_lw)
+        for m in bp["medians"]:
+            m.set_color("white")
+            m.set_linewidth(median_lw)
+
+    # ---- optional mean dot ----
+    if show_mean:
+        means = [vals_a.mean(), vals_b.mean()]
+        ax.scatter(
+            positions,
+            means,
+            s=mean_dot_size,
+            color=mean_dot_face,
+            edgecolor=mean_dot_edge,
+            linewidth=mean_dot_lw,
+            zorder=5,
+        )
+
+    # ---- x tick labels + counts ----
+    n_a, n_b = len(vals_a), len(vals_b)
+    if show_n:
+        xt = [
+            f"{lab_a}\n({n_fmt.format(n_a)})",
+            f"{lab_b}\n({n_fmt.format(n_b)})",
+        ]
+    else:
+        xt = [lab_a, lab_b]
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels(xt)
+
+    # ---- labels/title ----
+    ax.set_xlabel(x_label)
+    if y_label is None:
+        if transform == "none":
+            ylab = val_col
+        elif transform == "log2":
+            ylab = f"log2({val_col}+shift)"
+        elif transform == "log2_signed":
+            ylab = f"signed log2(1+|{val_col}|)"
+        elif transform == "log2p1":
+            ylab = f"log2(1+{val_col})"
+        elif transform == "zscore":
+            ylab = f"{val_col} (z-score)"
+        else:
+            ylab = f"{val_col} (robust z-score)"
+        ax.set_ylabel(ylab)
+    else:
+        ax.set_ylabel(y_label)
+
+    if title:
+        ax.set_title(title)
+
+    # ---- y-lims ----
+    data_ymin = float(np.nanmin(np.concatenate([vals_a, vals_b])))
+    data_ymax = float(np.nanmax(np.concatenate([vals_a, vals_b])))
+    data_yr = data_ymax - data_ymin if data_ymax > data_ymin else 1.0
+
+    if ylim is None:
+        ax.set_ylim(data_ymin - 0.05 * data_yr, data_ymax + 0.18 * data_yr)
+    else:
+        if (not isinstance(ylim, (tuple, list))) or len(ylim) != 2:
+            raise ValueError("ylim must be None or a (ymin, ymax) tuple.")
+        y0, y1 = float(ylim[0]), float(ylim[1])
+        if not np.isfinite(y0) or not np.isfinite(y1) or y1 <= y0:
+            raise ValueError(f"Invalid ylim={ylim}. Must be finite and ymax > ymin.")
+        ax.set_ylim(y0, y1)
+
+    # ---- NEW: median text annotations (uses final axis limits) ----
+    # ---- median annotation (colored to match violin) ----
+    if annotate_median:
+        meds = [float(np.median(vals_a)), float(np.median(vals_b))]
+
+        # Use x in data coords, y in axes coords (prevents clipping)
+        trans = ax.get_xaxis_transform()
+
+        for x, med, col in zip(positions, meds, colors):
+            ax.text(
+                x,
+                median_text_yfrac,  # e.g. 0.965
+                f"median = {med:.3f}",
+                transform=trans,
+                ha="center",
+                va="top",
+                fontsize=median_text_size,
+                fontweight=median_text_weight,
+                color=col,              # match violin color
+                clip_on=False,
+                zorder=6,
+            )
+
+
+    # ---- stats text (also uses final axis limits) ----
+    if do_mannwhitney and np.isfinite(pval):
+        stat_txt = (
+            f"MWU U={U:.2g}, p={pval:.2g}"
+            if qval is None else f"MWU U={U:.2g}, q={qval:.2g}"
+        )
+        y0, y1 = ax.get_ylim()
+        y_stat = y0 + 0.92 * (y1 - y0)
+        ax.text(
+            np.mean(positions),
+            y_stat,
+            stat_txt,
+            ha="center",
+            va="top",
+            fontsize=stats_fontsize,
+        )
+
+    ax.set_xlim(-0.5, x_gap + 0.5)
+    ax.tick_params(
+        axis="both",
+        which="major",
+        direction="out",
+        bottom=True,
+        top=False,
+        left=True,
+        right=False,
+        length=6,
+        width=1.2,
+    )
+
+    fig.tight_layout()
+
+    # ---- save ----
+    if save_svg:
+        if os.path.dirname(save_svg):
+            os.makedirs(os.path.dirname(save_svg), exist_ok=True)
+        fig.savefig(save_svg, format="svg", dpi=dpi, bbox_inches="tight", transparent=True)
+
+    # restore rc
+    if prev_font is not None:
+        mpl.rcParams["font.family"] = prev_font
+    if prev_svg is not None:
+        mpl.rcParams["svg.fonttype"] = prev_svg
+
+    stats = {"U": U, "p": pval, "q": qval}
+    return fig, ax, d, stats
+
+
 from matplotlib.ticker import PercentFormatter
 import pandas as pd
 def plot_bars_with_fisher_annotations(
@@ -886,3 +1287,499 @@ def dotplot_bootstrap_median_with_pearson(
 
     return fig, ax, stats
 
+
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from scipy.stats import kruskal, f_oneway, mannwhitneyu, ttest_ind
+from statsmodels.stats.multitest import multipletests
+
+
+def seaborn_multi_violin_from_df(
+    df,
+    value_col,
+    group_col,
+    *,
+    order=None,                 # optional explicit ordering
+    colors=None,
+    title="",
+    x_label = None,
+    y_label=None,
+    show_counts=True,
+    font_family="Arial",
+    width=0.8,
+    figsize=(5.6, 4.4),
+    grid_color="0.9",
+    rasterize_violins=False,
+    save_svg=None,
+    dpi=800,
+
+    # stats
+    test="kruskal",             # default is reviewer-safe
+    alternative="two-sided",
+    do_posthoc=False,
+    fdr_method="fdr_bh",
+
+    # mean dot
+    show_mean_dot=True,
+    mean_dot_size=120,
+):
+    """
+    Multi-violin plot pulling groups directly from a dataframe column.
+    """
+
+    # ----- SVG-safe fonts -----
+    prev_font = mpl.rcParams.get("font.family", None)
+    prev_svg  = mpl.rcParams.get("svg.fonttype", None)
+    mpl.rcParams["font.family"] = font_family
+    mpl.rcParams["svg.fonttype"] = "none"
+
+    # ----- clean -----
+    df = df[[value_col, group_col]].dropna()
+
+    if order is None:
+        # auto-sort numbers, otherwise keep categorical order
+        if np.issubdtype(df[group_col].dtype, np.number):
+            order = sorted(df[group_col].unique())
+        else:
+            order = list(pd.unique(df[group_col]))
+
+    groups = [
+        df.loc[df[group_col] == g, value_col].values.astype(float)
+        for g in order
+    ]
+
+    # remove nonfinite
+    groups = [g[np.isfinite(g)] for g in groups]
+
+    if any(len(g) == 0 for g in groups):
+        raise ValueError("At least one group is empty.")
+
+    # ----- GLOBAL TEST -----
+    if test == "kruskal":
+        res = kruskal(*groups)
+        stat, pval = float(res.statistic), float(res.pvalue)
+        stat_name = "H"
+        test_name = "Kruskal–Wallis"
+
+    elif test == "anova":
+        res = f_oneway(*groups)
+        stat, pval = float(res.statistic), float(res.pvalue)
+        stat_name = "F"
+        test_name = "One-way ANOVA"
+
+    else:
+        raise ValueError("test must be 'kruskal' or 'anova'")
+
+    # ----- POSTHOC -----
+    posthoc_df = None
+    if do_posthoc:
+        pairs = []
+        pvals = []
+
+        for i in range(len(order)):
+            for j in range(i+1, len(order)):
+
+                if test == "kruskal":
+                    r = mannwhitneyu(groups[i], groups[j], alternative=alternative)
+                    pv = r.pvalue
+                    method = "MWU"
+                else:
+                    r = ttest_ind(groups[i], groups[j], equal_var=False)
+                    pv = r.pvalue
+                    method = "Welch t"
+
+                pairs.append((order[i], order[j]))
+                pvals.append(pv)
+
+        _, qvals, _, _ = multipletests(pvals, method=fdr_method)
+
+        posthoc_df = pd.DataFrame({
+            "group1":[p[0] for p in pairs],
+            "group2":[p[1] for p in pairs],
+            "p":pvals,
+            "q":qvals,
+            "test":method
+        }).sort_values("q")
+
+    # ----- COLORS -----
+    if colors is None:
+        palette = sns.color_palette(n_colors=len(order))
+    else:
+        palette = colors
+
+    # ----- PLOT -----
+    fig, ax = plt.subplots(figsize=figsize, dpi=120)
+
+    ax.set_axisbelow(True)
+    ax.grid(axis="y", color=grid_color, lw=1)
+
+    sns.violinplot(
+        data=df,
+        x=group_col,
+        y=value_col,
+        order=order,
+        palette=palette,
+        inner=None,              # ← cleaner modern look
+        cut=0,
+        scale="width",
+        linewidth=1.1,
+        width=width/2,
+        ax=ax,
+        zorder=2.5
+    )
+
+    # black edges
+    for poly in ax.findobj(plt.Polygon):
+        poly.set_edgecolor("black")
+        poly.set_linewidth(1.1)
+
+    # median dots
+    if show_mean_dot:
+        med = df.groupby(group_col)[value_col].mean().reindex(order)
+
+        ax.scatter(
+            np.arange(len(order)),
+            med.values,
+            s=mean_dot_size,
+            color="white",
+            edgecolor="black",
+            linewidth=1.2,
+            zorder=3
+        )
+
+    # counts
+    if show_counts:
+        counts = df[group_col].value_counts().reindex(order)
+        ax.set_xticklabels([f"{g}\n(n={counts[g]:,})" for g in order])
+
+    # labels
+    if x_label:
+        ax.set_xlabel(x_label)
+    if y_label:
+        ax.set_ylabel(y_label)
+    if title:
+        ax.set_title(title)
+
+    # expand ylim for stats text
+    ymin, ymax = df[value_col].min(), df[value_col].max()
+    yr = ymax - ymin
+    ax.set_ylim(ymin - 0.05*yr, ymax + 0.20*yr)
+
+    ax.text(
+        1.2, ymax + 0.13*yr,
+        f"{test_name}: {stat_name}={stat:.2g}, p={pval:.2g}",
+        ha="center",
+        fontsize=14
+    )
+
+    # rasterize violins
+    if rasterize_violins:
+        from matplotlib.collections import PolyCollection
+        for coll in ax.collections:
+            if isinstance(coll, PolyCollection):
+                coll.set_rasterized(True)
+
+    # ax.spines["top"].set_visible(False)
+    # ax.spines["right"].set_visible(False)
+
+    plt.tight_layout()
+
+    if save_svg:
+        fig.savefig(save_svg, format="svg", dpi=dpi, bbox_inches="tight")
+
+    # restore rc
+    if prev_font is not None:
+        mpl.rcParams["font.family"] = prev_font
+    if prev_svg is not None:
+        mpl.rcParams["svg.fonttype"] = prev_svg
+
+    return {
+        "test": test_name,
+        "stat": stat,
+        "p": pval,
+        "posthoc": posthoc_df
+    }
+
+
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.collections import PathCollection
+from matplotlib.ticker import MultipleLocator, AutoMinorLocator
+def plot_group_mean_scatter_with_size(
+    df,
+    xcol="rgs_trimmed",
+    ycol="total_genes_transcribed_3genes",
+    zcol="zone_1indexed",
+    size_col=None,                      # ← NOW OPTIONAL
+    size_stat="mean",
+    s_min=100,
+    s_max=600,
+    cmap_name="viridis_r",
+    add_reg_line=True,
+    rasterize_scatter=False,
+    save_svg=None,
+    figsize=(15, 5),
+
+    # labels
+    x_label=None,
+    y_label=None,
+    group_label=None,
+    z_label=None,
+
+    # title + stats
+    title=None,
+    add_pearson=True,
+    pearson_loc=(0.02, 0.98),
+    pearson_fontsize=None,
+
+    # ticks
+    x_major_step=0.05,
+    y_major_step=0.2,
+    style="white",
+
+    # font behavior
+    font_scale=None,
+    tick_labelsize=None,
+    label_fontsize=None,
+    legend_fontsize=None,
+    legend_title_fontsize=None,
+    seed=None,
+):
+    if seed is not None:
+        np.random.seed(seed)
+
+    if font_scale is not None:
+        base = mpl.rcParams
+        rc_updates = {
+            "font.size": base["font.size"] * font_scale,
+            "axes.labelsize": base["axes.labelsize"] * font_scale,
+            "axes.titlesize": base["axes.titlesize"] * font_scale,
+            "xtick.labelsize": base["xtick.labelsize"] * font_scale,
+            "ytick.labelsize": base["ytick.labelsize"] * font_scale,
+            "legend.fontsize": base["legend.fontsize"] * font_scale,
+            "legend.title_fontsize":
+                base.get("legend.title_fontsize", base["legend.fontsize"]) * font_scale,
+        }
+        rc_ctx = mpl.rc_context(rc_updates)
+    else:
+        rc_ctx = mpl.rc_context()
+
+    with rc_ctx:
+        sns.set(style=style)
+
+        # ======================
+        # summarize
+        # ======================
+        required_cols = [zcol, xcol, ycol]
+        if size_col is not None:
+            required_cols.append(size_col)
+
+        g = (
+            df.dropna(subset=required_cols)
+              .groupby(zcol, observed=True)
+              .agg(
+                  x_mean=(xcol, "mean"),
+                  y_mean=(ycol, "mean"),
+                  **(
+                      {"size_val": (size_col, size_stat)}
+                      if size_col is not None else {}
+                  )
+              )
+              .reset_index()
+        )
+
+        if g.empty:
+            raise ValueError("No rows remain after dropna/groupby.")
+
+        zone_num = pd.to_numeric(g[zcol].astype(str), errors="coerce")
+        if zone_num.isna().any():
+            zone_num = pd.Categorical(g[zcol]).codes + 1
+
+        g = (
+            g.assign(zone_num=zone_num)
+             .sort_values("zone_num")
+             .reset_index(drop=True)
+        )
+
+        # ======================
+        # size mapping
+        # ======================
+        if size_col is None:
+            sizes = np.full(len(g), (s_min + s_max) / 2)
+
+            def map_size(val):
+                return (s_min + s_max) / 2
+        else:
+            v = pd.to_numeric(g["size_val"], errors="coerce").to_numpy()
+            lo, hi = np.nanpercentile(v, [5, 95])
+
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                sizes = np.full_like(v, (s_min + s_max) / 2, dtype=float)
+
+                def map_size(val):
+                    return (s_min + s_max) / 2
+            else:
+                v_clip = np.clip(v, lo, hi)
+                sizes = s_min + (v_clip - lo) / (hi - lo) * (s_max - s_min)
+
+                def map_size(val):
+                    val = np.clip(val, lo, hi)
+                    return s_min + (val - lo) / (hi - lo) * (s_max - s_min)
+
+        # ======================
+        # colors
+        # ======================
+        cmap = plt.get_cmap(cmap_name)
+        K = len(g)
+        colors = [cmap(i / max(K - 1, 1)) for i in range(K)]
+
+        # ======================
+        # plot
+        # ======================
+        fig, ax = plt.subplots(figsize=figsize)
+
+        if add_reg_line and K >= 3:
+            sns.regplot(
+                data=g,
+                x="x_mean",
+                y="y_mean",
+                scatter=False,
+                ci=95,
+                color="#666666",
+                line_kws=dict(linewidth=1.5, alpha=0.9),
+                ax=ax,
+            )
+            for ln in ax.lines:
+                ln.set_zorder(1)
+
+        ax.scatter(
+            g["x_mean"], g["y_mean"],
+            s=sizes,
+            c=colors,
+            edgecolors="white",
+            linewidths=0.9,
+            alpha=0.75,
+            zorder=3,
+        )
+
+        ax.set_xlabel(x_label if x_label else f"Mean {xcol}", fontsize=label_fontsize)
+        ax.set_ylabel(y_label if y_label else f"Mean {ycol}", fontsize=label_fontsize)
+
+        if title is not None:
+            ax.set_title(title)
+
+        # ======================
+        # Pearson
+        # ======================
+        if add_pearson:
+            try:
+                from scipy.stats import pearsonr
+                x = pd.to_numeric(g["x_mean"], errors="coerce").to_numpy()
+                y = pd.to_numeric(g["y_mean"], errors="coerce").to_numpy()
+                ok = np.isfinite(x) & np.isfinite(y)
+                if np.sum(ok) >= 2:
+                    r, p = pearsonr(x[ok], y[ok])
+                    ptxt = f"{p:.1e}" if p < 1e-3 else f"{p:.3f}"
+                    stat_txt = f"Pearson r = {r:.2f}\np = {ptxt}"
+                else:
+                    stat_txt = "Pearson r: NA\np: NA\nN < 2"
+            except Exception:
+                stat_txt = "Pearson r: NA\np: NA"
+
+            ax.text(
+                pearson_loc[0], pearson_loc[1],
+                stat_txt,
+                transform=ax.transAxes,
+                ha="left", va="top",
+                fontsize=pearson_fontsize,
+            )
+
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        ax.grid(False)
+
+        ax.xaxis.set_major_locator(MultipleLocator(x_major_step))
+        ax.yaxis.set_major_locator(MultipleLocator(y_major_step))
+        # ax.xaxis.set_minor_locator(AutoMinorLocator(2))
+        # ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+
+        ax.tick_params(axis="both", which="major",
+                       direction="out", length=6, width=1.2,
+                       labelsize=tick_labelsize)
+        ax.tick_params(axis="both", which="minor",
+                       direction="out", length=3, width=0.9)
+        ax.tick_params(
+            axis="both",
+            which="both",
+            direction="out",
+            bottom=True,
+            top=False,        # ← turn on top ticks
+            left=True,
+            right=False       # ← turn on right ticks
+        )
+
+
+        # ======================
+        # legends
+        # ======================
+        z_title = z_label if z_label else zcol
+
+        color_handles = [
+            Line2D([0], [0], marker="o", linestyle="",
+                   markerfacecolor=colors[i], markeredgecolor="white",
+                   markersize=8, label=str(g.loc[i, zcol]))
+            for i in range(K)
+        ]
+
+        leg1 = ax.legend(
+            handles=color_handles,
+            title=z_title,
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            fontsize=legend_fontsize,
+            title_fontsize=legend_title_fontsize,
+            frameon=True,
+        )
+        ax.add_artist(leg1)  # <-- keep color legend no matter what
+
+        if size_col is not None:
+            size_title = group_label if group_label else size_col
+            qvals = np.nanpercentile(v, [10, 50, 90])
+            qvals = np.unique(np.round(qvals, 3))
+
+            size_handles = [
+                ax.scatter([], [], s=map_size(q),
+                           facecolors="none", edgecolors="k", linewidths=0.8)
+                for q in qvals
+            ]
+
+            ax.legend(
+                size_handles,
+                [str(q) for q in qvals],
+                title=size_title,
+                loc="upper left",
+                bbox_to_anchor=(1.02, 0.55),
+                fontsize=legend_fontsize,
+                title_fontsize=legend_title_fontsize,
+                frameon=True,
+            )
+
+        plt.tight_layout(rect=[0, 0, 0.78, 1])
+
+        if rasterize_scatter:
+            for coll in ax.collections:
+                if isinstance(coll, PathCollection):
+                    coll.set_rasterized(True)
+
+        if save_svg:
+            fig.savefig(save_svg, format="svg", dpi=1200,
+                        bbox_inches="tight", transparent=True)
+
+        return fig, ax, g
